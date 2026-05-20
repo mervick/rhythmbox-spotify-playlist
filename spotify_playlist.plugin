@@ -1,0 +1,10 @@
+[Plugin]
+Module=spotify_playlist
+Loader=python3
+IAge=2
+Name=Spotify Playlist
+Description=Add currently playing song to a Spotify playlist
+Authors=Andrey Izman <izmanw@gmail.com>
+Copyright=Copyright © Andrey Izman 2026
+Website=https://github.com/mervick/rhythmbox-spotify-playlist
+Version=1.0
