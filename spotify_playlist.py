@@ -478,7 +478,8 @@ class SpotifyPlaylistPlugin(GObject.Object, Peas.Activatable):
         self._on_add_to_playlist(action, param, add_to_last_id=True)
 
 
-    def _on_add_to_playlist(self, action, param, add_to_last_id=False) -> None:
+    # def _on_add_to_playlist(self, action, param, add_to_last_id=False) -> None:
+    def _on_add_to_playlist(self, action, param, add_to_last_id=True) -> None:
         if not self._ensure_client() or not self._ensure_authenticated():
             return
 
