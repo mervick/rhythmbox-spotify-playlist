@@ -32,8 +32,8 @@ Then in Rhythmbox:
 5. Select any song → **Tools → Add to Spotify playlist…**
 
 The plugin compares tracks from the first page of Spotify search results by
-title, all credited artists, and duration when available. It continues
+title, all credited artists (including trailing `feat.` credits in the title),
+and duration when available. It continues
 automatically only when exactly one result has an exact title and artist match
 with a compatible duration. Otherwise, choose the recording from the ranked
 list before adding it to a playlist.
-

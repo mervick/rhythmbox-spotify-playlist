@@ -25,6 +25,41 @@ class MatchingTests(unittest.TestCase):
         self.assertEqual(plugin._automatic_match(matches), duo)
         self.assertFalse(plugin._candidate_match(solo, "Artist & Guest", "Song", None)[1])
 
+    def test_featured_artist_moves_between_title_and_artist_fields(self):
+        variants = [
+            ("Artist 1", "Song (feat. Artist 2)"),
+            ("Artist 1; Artist 2", "Song"),
+            ("Artist 1 feat. Artist 2", "Song"),
+            ("Artist 1", "Song - ft. Artist 2"),
+            ("Artist 1 x Artist 2", "Song"),
+            ("Artist 1", "Song (with Artist 2)"),
+        ]
+        spotify_variants = [
+            track("artists", "Song", "Artist 1", "Artist 2"),
+            track("title", "Song [featuring Artist 2]", "Artist 1"),
+            track("duplicate", "Song (feat. Artist 2)", "Artist 1", "Artist 2"),
+        ]
+        for artist, title in variants:
+            for candidate in spotify_variants:
+                with self.subTest(artist=artist, title=title, candidate=candidate["uri"]):
+                    self.assertEqual(plugin._candidate_match(candidate, artist, title, None),
+                                     (100.0, True))
+
+    def test_different_featured_artist_is_not_exact(self):
+        candidate = track("wrong", "Song (feat. Artist 3)", "Artist 1")
+        self.assertFalse(plugin._candidate_match(
+            candidate, "Artist 1; Artist 2", "Song", None)[1])
+
+    def test_live_version_is_not_removed_from_title(self):
+        candidate = track("live", "Song (Live) (feat. Artist 2)", "Artist 1")
+        self.assertFalse(plugin._candidate_match(
+            candidate, "Artist 1; Artist 2", "Song", None)[1])
+
+    def test_title_credit_alone_does_not_replace_missing_main_artist(self):
+        candidate = track("incomplete", "Song (feat. Artist 2)")
+        self.assertFalse(plugin._candidate_match(
+            candidate, "Artist 2", "Song", None)[1])
+
     def test_multiple_exact_recordings_require_user_choice(self):
         first = track("first", "Song", "Artist")
         second = track("second", "Song", "Artist")
@@ -60,6 +95,22 @@ class MatchingTests(unittest.TestCase):
         self.assertEqual(get.call_count, 2)
         self.assertTrue(all(call.kwargs["params"]["limit"] == 50
                             for call in get.call_args_list))
+
+    def test_search_uses_base_title_and_lead_artist(self):
+        client = plugin.SpotifyClient("client")
+
+        class Response:
+            ok = True
+
+            def json(self):
+                return {"tracks": {"items": []}}
+
+        with patch.object(client, "access_token", return_value="token"), \
+             patch.object(plugin.requests, "get", return_value=Response()) as get:
+            client.search_tracks("Artist 1; Artist 2", "Song (feat. Artist 2)")
+
+        self.assertEqual(get.call_args_list[0].kwargs["params"]["q"],
+                         "artist:artist 1 track:Song")
 
 
 if __name__ == "__main__":

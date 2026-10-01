@@ -96,8 +96,8 @@ def _save_settings(data: dict) -> None:
 
 
 def _clean_title(title: str) -> str:
-    """Keep version and featured-artist details when comparing titles."""
-    return _normalize(title)
+    """Compare the song title without a trailing featured-artist credit."""
+    return _normalize(_split_title_credit(title)[0])
 
 
 def _normalize(s: str) -> str:
@@ -107,25 +107,47 @@ def _normalize(s: str) -> str:
 
 
 def _artist_names(value: str) -> list[str]:
-    parts = re.split(r"\s*(?:,|;|\s+&\s+|\s+feat\.?\s+|\s+ft\.?\s+)\s*", value or "")
+    parts = re.split(r"\s*(?:,|;|\s+[&×x]\s+|\s+(?:feat|ft|featuring)\.?\s+)\s*", value or "", flags=re.IGNORECASE)
     return [name for part in parts if (name := _normalize(part))]
+
+
+def _split_title_credit(title: str) -> tuple[str, str]:
+    """Extract only an explicit trailing feat/ft/featuring credit."""
+    title = title or ""
+    match = re.match(r"^(.*?)\s*[\(\[]\s*(?:feat|ft|featuring|with)\.?\s+(.+?)\s*[\)\]]\s*$",
+                     title, flags=re.IGNORECASE)
+    if not match:
+        match = re.match(r"^(.*?)\s+(?:feat|ft|featuring)\.?\s+(.+?)\s*$",
+                         title, flags=re.IGNORECASE)
+    if match and match.group(1).strip(" -–—") and match.group(2).strip():
+        return match.group(1).strip(" -–—"), match.group(2)
+    return title, ""
+
+
+def _credits(artist_fields: list[str], title: str) -> list[str]:
+    names = set()
+    for field in artist_fields + [_split_title_credit(title)[1]]:
+        names.update(_artist_names(field))
+    return sorted(names)
 
 
 def _candidate_match(candidate: dict, want_artist: str, want_title: str,
                      duration_ms: Optional[int]) -> tuple[float, bool]:
     """Return similarity for display and whether the track is an exact match."""
     title = _clean_title(candidate.get("name", ""))
-    artist_names = [name for artist in candidate.get("artists", [])
-                    if (name := _normalize(artist.get("name", "")))]
-    wanted_artists = _artist_names(want_artist)
+    candidate_artist_fields = [artist.get("name", "") for artist in candidate.get("artists", [])]
+    if not _artist_names(want_artist) or not any(_artist_names(field) for field in candidate_artist_fields):
+        return 0.0, False
+    artist_names = _credits(candidate_artist_fields, candidate.get("name", ""))
+    wanted_artists = _credits([want_artist], want_title)
     wanted_title = _clean_title(want_title)
     if not title or not artist_names or not wanted_title or not wanted_artists:
         return 0.0, False
 
-    exact = title == wanted_title and sorted(artist_names) == sorted(wanted_artists)
+    exact = title == wanted_title and artist_names == wanted_artists
     title_score = difflib.SequenceMatcher(None, wanted_title, title).ratio()
     artist_score = difflib.SequenceMatcher(
-        None, ", ".join(sorted(wanted_artists)), ", ".join(sorted(artist_names))
+        None, ", ".join(wanted_artists), ", ".join(artist_names)
     ).ratio()
     score = (0.6 * title_score + 0.4 * artist_score) * 100
     candidate_duration = candidate.get("duration_ms")
@@ -268,7 +290,10 @@ class SpotifyClient:
             return []
         tracks = {}
         succeeded = False
-        for q in [f"artist:{artist} track:{title}", f"{artist} {title}"]:
+        base_title = _split_title_credit(title)[0]
+        lead_artist = _artist_names(artist)
+        lead_artist = lead_artist[0] if lead_artist else artist
+        for q in [f"artist:{lead_artist} track:{base_title}", f"{lead_artist} {base_title}"]:
             try:
                 r = requests.get(
                     f"{SPOTIFY_API_BASE}/search",
