@@ -131,42 +131,86 @@ def _credits(artist_fields: list[str], title: str) -> list[str]:
     return sorted(names)
 
 
-def _candidate_match(candidate: dict, want_artist: str, want_title: str,
-                     duration_ms: Optional[int]) -> tuple[float, bool]:
-    """Return similarity for display and whether the track is an exact match."""
+def _match_details(candidate: dict, want_artist: str, want_title: str,
+                   duration_ms: Optional[int]) -> dict:
+    """Calculate component scores used for ranking and console diagnostics."""
     title = _clean_title(candidate.get("name", ""))
     candidate_artist_fields = [artist.get("name", "") for artist in candidate.get("artists", [])]
-    if not _artist_names(want_artist) or not any(_artist_names(field) for field in candidate_artist_fields):
-        return 0.0, False
     artist_names = _credits(candidate_artist_fields, candidate.get("name", ""))
     wanted_artists = _credits([want_artist], want_title)
     wanted_title = _clean_title(want_title)
-    if not title or not artist_names or not wanted_title or not wanted_artists:
-        return 0.0, False
-
-    exact = title == wanted_title and artist_names == wanted_artists
-    title_score = difflib.SequenceMatcher(None, wanted_title, title).ratio()
-    artist_score = difflib.SequenceMatcher(
+    has_primary_artists = bool(_artist_names(want_artist)) and any(
+        _artist_names(field) for field in candidate_artist_fields)
+    valid = bool(title and artist_names and wanted_title and wanted_artists and has_primary_artists)
+    title_score = (difflib.SequenceMatcher(None, wanted_title, title).ratio() * 100
+                   if valid else 0.0)
+    artist_score = (difflib.SequenceMatcher(
         None, ", ".join(wanted_artists), ", ".join(artist_names)
-    ).ratio()
-    score = (0.6 * title_score + 0.4 * artist_score) * 100
+    ).ratio() * 100 if valid else 0.0)
+
     candidate_duration = candidate.get("duration_ms")
-    if duration_ms and isinstance(candidate_duration, (int, float)):
-        difference = abs(candidate_duration - duration_ms)
-        if difference > 10000:
-            score -= 15
-            exact = False
-        elif difference > 4000:
-            score -= 5
-            exact = False
-    return round(max(0.0, min(100.0, score)), 1), exact
+    duration_delta = None
+    duration_score = None
+    if duration_ms and isinstance(candidate_duration, (int, float)) and candidate_duration > 0:
+        duration_delta = abs(candidate_duration - duration_ms)
+        if duration_delta <= 2000:
+            duration_score = 100.0
+        elif duration_delta <= 4000:
+            duration_score = 85.0
+        elif duration_delta <= 10000:
+            duration_score = 60.0
+        else:
+            duration_score = 0.0
+
+    if duration_ms is None:
+        score = 0.6 * title_score + 0.4 * artist_score
+    else:
+        score = 0.5 * title_score + 0.3 * artist_score + 0.2 * (duration_score or 0.0)
+    if not valid:
+        score = 0.0
+    exact = (valid and title == wanted_title and artist_names == wanted_artists
+             and (duration_ms is None or
+                  (duration_delta is not None and duration_delta <= 2000)))
+    return {
+        "score": round(score, 1), "exact": exact,
+        "title_score": round(title_score, 1), "artist_score": round(artist_score, 1),
+        "duration_score": duration_score, "duration_delta_ms": duration_delta,
+        "title": title, "artists": artist_names,
+    }
+
+
+def _candidate_match(candidate: dict, want_artist: str, want_title: str,
+                     duration_ms: Optional[int]) -> tuple[float, bool]:
+    details = _match_details(candidate, want_artist, want_title, duration_ms)
+    return details["score"], details["exact"]
 
 
 def _rank_candidates(tracks: list[dict], artist: str, title: str,
                      duration_ms: Optional[int]) -> list[tuple[dict, float, bool]]:
-    matches = [(track, *_candidate_match(track, artist, title, duration_ms))
-               for track in tracks]
-    return sorted(matches, key=lambda match: (match[2], match[1]), reverse=True)
+    ranked = [(track, _match_details(track, artist, title, duration_ms)) for track in tracks]
+    ranked.sort(key=lambda item: (item[1]["exact"], item[1]["score"],
+                                  -(item[1]["duration_delta_ms"]
+                                    if item[1]["duration_delta_ms"] is not None else float("inf"))),
+                reverse=True)
+    print(f"[spotify_playlist] Matching {len(ranked)} Spotify tracks for "
+          f"title={title!r}, artists={artist!r}, duration_ms={duration_ms!r} "
+          f"normalized_title={_clean_title(title)!r} "
+          f"normalized_artists={_credits([artist], title)!r}", flush=True)
+    for rank, (track, details) in enumerate(ranked, 1):
+        delta = details["duration_delta_ms"]
+        duration_text = (f"{details['duration_score']:.0f}% (Δ{delta / 1000:.1f}s)"
+                         if delta is not None else "unavailable")
+        print(f"[spotify_playlist] rank={rank}/{len(ranked)} uri={track.get('uri')!r} "
+              f"title={track.get('name')!r} "
+              f"artists={[a.get('name', '') for a in track.get('artists', [])]!r} "
+              f"normalized_title={details['title']!r} "
+              f"normalized_artists={details['artists']!r} "
+              f"duration_ms={track.get('duration_ms')!r} "
+              f"title_match={details['title_score']:.1f}% "
+              f"artist_match={details['artist_score']:.1f}% "
+              f"duration_match={duration_text} score={details['score']:.1f}% "
+              f"exact={details['exact']}", flush=True)
+    return [(track, details["score"], details["exact"]) for track, details in ranked]
 
 
 def _automatic_match(matches: list[tuple[dict, float, bool]]) -> Optional[dict]:
@@ -608,9 +652,11 @@ class SpotifyPlaylistPlugin(GObject.Object, Peas.Activatable):
         def _got_matches(matches, error):
             wait.destroy()
             if error:
+                print(f"[spotify_playlist] Spotify search failed: {error}", flush=True)
                 self._show_error("Spotify search failed", GLib.markup_escape_text(error))
                 return
             if not matches:
+                print("[spotify_playlist] Spotify search returned no tracks", flush=True)
                 self._show_error(
                     "Track not found",
                     f'Could not find <b>{GLib.markup_escape_text(title)}</b> by '
@@ -618,10 +664,12 @@ class SpotifyPlaylistPlugin(GObject.Object, Peas.Activatable):
                 return
             track = _automatic_match(matches)
             if track:
+                print(f"[spotify_playlist] Auto-selected exact match: {track['uri']}", flush=True)
                 self._show_playlist_picker(track["uri"], track["name"],
                                            ", ".join(a["name"] for a in track["artists"]),
                                            add_to_last_id=add_to_last_id)
             else:
+                print("[spotify_playlist] User selection required: no unique exact match", flush=True)
                 self._show_track_picker(matches, add_to_last_id)
 
         threading.Thread(target=_search, daemon=True).start()
@@ -656,8 +704,11 @@ class SpotifyPlaylistPlugin(GObject.Object, Peas.Activatable):
         index = model.get_path(selected).get_indices()[0] if selected else None
         dlg.destroy()
         if response != Gtk.ResponseType.OK or index is None:
+            print("[spotify_playlist] Track selection cancelled", flush=True)
             return
         track = matches[index][0]
+        print(f"[spotify_playlist] User selected rank={index + 1}/{len(matches)} "
+              f"uri={track['uri']!r}", flush=True)
         self._show_playlist_picker(track["uri"], track["name"],
                                    ", ".join(a["name"] for a in track["artists"]),
                                    add_to_last_id=add_to_last_id)

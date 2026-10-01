@@ -37,3 +37,9 @@ and duration when available. It continues
 automatically only when exactly one result has an exact title and artist match
 with a compatible duration. Otherwise, choose the recording from the ranked
 list before adding it to a playlist.
+
+The Rhythmbox console logs every candidate in ranked order with separate title,
+artist, and duration scores, the duration difference, total score, and whether
+the match can be selected automatically.
+When both durations are known, the score weights are 50% title, 30% artists,
+and 20% duration; automatic matching allows at most a two-second difference.

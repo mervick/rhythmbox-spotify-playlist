@@ -1,3 +1,5 @@
+import contextlib
+import io
 import unittest
 from unittest.mock import patch
 
@@ -71,6 +73,44 @@ class MatchingTests(unittest.TestCase):
         matches = plugin._rank_candidates([candidate], "Artist", "Song", 180000)
         self.assertIsNone(plugin._automatic_match(matches))
         self.assertLess(matches[0][1], 100)
+
+    def test_duration_breaks_name_tie_and_logs_every_rank(self):
+        wrong_length = track("long", "Song", "Artist", duration_ms=220000)
+        right_length = track("right", "Song", "Artist", duration_ms=181000)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            matches = plugin._rank_candidates(
+                [wrong_length, right_length], "Artist", "Song", 180000)
+        self.assertEqual(plugin._automatic_match(matches), right_length)
+        self.assertEqual([item[0]["uri"] for item in matches], ["right", "long"])
+        log = output.getvalue()
+        self.assertIn("rank=1/2 uri='right'", log)
+        self.assertIn("rank=2/2 uri='long'", log)
+        self.assertIn("title_match=100.0%", log)
+        self.assertIn("artist_match=100.0%", log)
+        self.assertIn("duration_match=100% (Δ1.0s)", log)
+        self.assertIn("duration_match=0% (Δ40.0s)", log)
+
+    def test_missing_candidate_duration_requires_choice_when_source_has_duration(self):
+        candidate = track("unknown", "Song", "Artist")
+        candidate.pop("duration_ms")
+        matches = plugin._rank_candidates([candidate], "Artist", "Song", 180000)
+        self.assertIsNone(plugin._automatic_match(matches))
+        self.assertEqual(matches[0][1], 80.0)
+
+    def test_closer_duration_breaks_equal_score_tie(self):
+        two_seconds = track("two", "Song", "Artist", duration_ms=182000)
+        exact_length = track("zero", "Song", "Artist", duration_ms=180000)
+        matches = plugin._rank_candidates(
+            [two_seconds, exact_length], "Artist", "Song", 180000)
+        self.assertEqual([item[0]["uri"] for item in matches], ["zero", "two"])
+        self.assertIsNone(plugin._automatic_match(matches))
+
+    def test_three_second_difference_requires_choice(self):
+        candidate = track("three", "Song", "Artist", duration_ms=183000)
+        score, exact = plugin._candidate_match(candidate, "Artist", "Song", 180000)
+        self.assertEqual(score, 97.0)
+        self.assertFalse(exact)
 
     def test_search_reads_full_first_pages_and_deduplicates(self):
         first = track("first", "Wrong", "Artist")
