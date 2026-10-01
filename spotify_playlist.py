@@ -12,18 +12,22 @@ Requirements:
 from __future__ import annotations
 
 import base64
-import gi
+import difflib
 import hashlib
 import json
 import os
+import re
 import secrets
 import threading
 import time
 import urllib.parse
+import unicodedata
 import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Optional
+
+import gi
 
 gi.require_version("RB", "3.0")
 gi.require_version("Gtk", "3.0")
@@ -89,6 +93,63 @@ def _load_settings() -> dict:
 def _save_settings(data: dict) -> None:
     SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
     SETTINGS_FILE.write_text(json.dumps(data))
+
+
+def _clean_title(title: str) -> str:
+    """Keep version and featured-artist details when comparing titles."""
+    return _normalize(title)
+
+
+def _normalize(s: str) -> str:
+    """Ignore case, punctuation and whitespace, but preserve all words."""
+    s = unicodedata.normalize("NFKC", s or "").casefold()
+    return " ".join(re.findall(r"[^\W_]+", s, flags=re.UNICODE))
+
+
+def _artist_names(value: str) -> list[str]:
+    parts = re.split(r"\s*(?:,|;|\s+&\s+|\s+feat\.?\s+|\s+ft\.?\s+)\s*", value or "")
+    return [name for part in parts if (name := _normalize(part))]
+
+
+def _candidate_match(candidate: dict, want_artist: str, want_title: str,
+                     duration_ms: Optional[int]) -> tuple[float, bool]:
+    """Return similarity for display and whether the track is an exact match."""
+    title = _clean_title(candidate.get("name", ""))
+    artist_names = [name for artist in candidate.get("artists", [])
+                    if (name := _normalize(artist.get("name", "")))]
+    wanted_artists = _artist_names(want_artist)
+    wanted_title = _clean_title(want_title)
+    if not title or not artist_names or not wanted_title or not wanted_artists:
+        return 0.0, False
+
+    exact = title == wanted_title and sorted(artist_names) == sorted(wanted_artists)
+    title_score = difflib.SequenceMatcher(None, wanted_title, title).ratio()
+    artist_score = difflib.SequenceMatcher(
+        None, ", ".join(sorted(wanted_artists)), ", ".join(sorted(artist_names))
+    ).ratio()
+    score = (0.6 * title_score + 0.4 * artist_score) * 100
+    candidate_duration = candidate.get("duration_ms")
+    if duration_ms and isinstance(candidate_duration, (int, float)):
+        difference = abs(candidate_duration - duration_ms)
+        if difference > 10000:
+            score -= 15
+            exact = False
+        elif difference > 4000:
+            score -= 5
+            exact = False
+    return round(max(0.0, min(100.0, score)), 1), exact
+
+
+def _rank_candidates(tracks: list[dict], artist: str, title: str,
+                     duration_ms: Optional[int]) -> list[tuple[dict, float, bool]]:
+    matches = [(track, *_candidate_match(track, artist, title, duration_ms))
+               for track in tracks]
+    return sorted(matches, key=lambda match: (match[2], match[1]), reverse=True)
+
+
+def _automatic_match(matches: list[tuple[dict, float, bool]]) -> Optional[dict]:
+    exact = [track for track, _, is_exact in matches if is_exact]
+    return exact[0] if len(exact) == 1 else None
 
 
 # ---------------------------------------------------------------------------
@@ -201,21 +262,29 @@ class SpotifyClient:
             url = data.get("next")
         return result
 
-    def search_track(self, artist: str, title: str) -> Optional[str]:
+    def search_tracks(self, artist: str, title: str) -> list[dict]:
         tok = self.access_token()
         if not tok:
-            return None
+            return []
+        tracks = {}
+        succeeded = False
         for q in [f"artist:{artist} track:{title}", f"{artist} {title}"]:
-            r = requests.get(
-                f"{SPOTIFY_API_BASE}/search",
-                params={"q": q, "type": "track", "limit": 1},
-                headers={"Authorization": f"Bearer {tok}"},
-            )
+            try:
+                r = requests.get(
+                    f"{SPOTIFY_API_BASE}/search",
+                    params={"q": q, "type": "track", "limit": 50},
+                    headers={"Authorization": f"Bearer {tok}"}, timeout=15,
+                )
+            except requests.RequestException:
+                continue
             if r.ok:
-                items = r.json().get("tracks", {}).get("items", [])
-                if items:
-                    return items[0]["uri"]
-        return None
+                succeeded = True
+                for item in r.json().get("tracks", {}).get("items", []):
+                    if item and item.get("uri"):
+                        tracks.setdefault(item["uri"], item)
+        if not succeeded:
+            raise RuntimeError("Spotify search failed. Check your connection and authorization.")
+        return list(tracks.values())
 
     def add_to_playlist(self, playlist_id: str, track_uri: str) -> bool:
         tok = self.access_token()
@@ -490,6 +559,11 @@ class SpotifyPlaylistPlugin(GObject.Object, Peas.Activatable):
 
         artist = entry.get_string(RB.RhythmDBPropType.ARTIST) or ""
         title  = entry.get_string(RB.RhythmDBPropType.TITLE)  or ""
+        try:
+            duration_seconds = entry.get_ulong(RB.RhythmDBPropType.DURATION)
+            duration_ms = duration_seconds * 1000 if duration_seconds else None
+        except (AttributeError, TypeError, ValueError):
+            duration_ms = None
         window = self._shell.props.window
 
         wait = Gtk.MessageDialog(transient_for=window, modal=False,
@@ -499,20 +573,69 @@ class SpotifyPlaylistPlugin(GObject.Object, Peas.Activatable):
         wait.show()
 
         def _search():
-            uri = self._client.search_track(artist, title)
-            GLib.idle_add(_got_uri, uri)
+            try:
+                tracks = self._client.search_tracks(artist, title)
+                matches = _rank_candidates(tracks, artist, title, duration_ms)
+                GLib.idle_add(_got_matches, matches, None)
+            except Exception as exc:
+                GLib.idle_add(_got_matches, [], str(exc))
 
-        def _got_uri(track_uri):
+        def _got_matches(matches, error):
             wait.destroy()
-            if not track_uri:
+            if error:
+                self._show_error("Spotify search failed", GLib.markup_escape_text(error))
+                return
+            if not matches:
                 self._show_error(
                     "Track not found",
                     f'Could not find <b>{GLib.markup_escape_text(title)}</b> by '
                     f'<b>{GLib.markup_escape_text(artist)}</b> on Spotify.')
                 return
-            self._show_playlist_picker(track_uri, title, artist, add_to_last_id=add_to_last_id)
+            track = _automatic_match(matches)
+            if track:
+                self._show_playlist_picker(track["uri"], track["name"],
+                                           ", ".join(a["name"] for a in track["artists"]),
+                                           add_to_last_id=add_to_last_id)
+            else:
+                self._show_track_picker(matches, add_to_last_id)
 
         threading.Thread(target=_search, daemon=True).start()
+
+    def _show_track_picker(self, matches, add_to_last_id) -> None:
+        dlg = Gtk.Dialog(title="Choose Spotify track",
+                         transient_for=self._shell.props.window, modal=True)
+        dlg.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
+                        "Continue", Gtk.ResponseType.OK)
+        dlg.set_default_size(680, 440)
+        box = dlg.get_content_area()
+        box.pack_start(Gtk.Label(label="Select the matching recording:", xalign=0,
+                                 margin=10), False, False, 0)
+        store = Gtk.ListStore(str, str, str, str)
+        for track, score, exact in matches:
+            artists = ", ".join(a.get("name", "") for a in track.get("artists", []))
+            duration = track.get("duration_ms")
+            length = f"{duration // 60000}:{duration // 1000 % 60:02d}" if isinstance(duration, int) else ""
+            store.append([track["name"], artists, length,
+                          "Exact" if exact else f"{score:.1f}%"])
+        tv = Gtk.TreeView(model=store)
+        for index, heading in enumerate(("Title", "Artists", "Length", "Match")):
+            tv.append_column(Gtk.TreeViewColumn(heading, Gtk.CellRendererText(), text=index))
+        selection = tv.get_selection()
+        selection.select_path(Gtk.TreePath.new_first())
+        sw = Gtk.ScrolledWindow(hexpand=True, vexpand=True)
+        sw.add(tv)
+        box.pack_start(sw, True, True, 0)
+        dlg.show_all()
+        response = dlg.run()
+        model, selected = selection.get_selected()
+        index = model.get_path(selected).get_indices()[0] if selected else None
+        dlg.destroy()
+        if response != Gtk.ResponseType.OK or index is None:
+            return
+        track = matches[index][0]
+        self._show_playlist_picker(track["uri"], track["name"],
+                                   ", ".join(a["name"] for a in track["artists"]),
+                                   add_to_last_id=add_to_last_id)
 
     # ------------------------------------------------------------------ playlist picker
 
