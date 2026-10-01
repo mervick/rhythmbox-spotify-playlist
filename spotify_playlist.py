@@ -18,11 +18,13 @@ import json
 import os
 import re
 import secrets
+import sqlite3
 import threading
 import time
 import urllib.parse
 import unicodedata
 import webbrowser
+from contextlib import closing
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Optional
@@ -52,6 +54,7 @@ REDIRECT_URI      = "http://127.0.0.1:8888/callback"
 SCOPES            = "playlist-modify-public playlist-modify-private playlist-read-private"
 TOKEN_CACHE       = Path.home() / ".config" / "rhythmbox" / "spotify_playlist_token.json"
 SETTINGS_FILE     = Path.home() / ".config" / "rhythmbox" / "spotify_playlist_settings.json"
+MATCHES_DB         = Path.home() / ".config" / "rhythmbox" / "spotify_playlist_matches.sqlite3"
 
 
 # ---------------------------------------------------------------------------
@@ -93,6 +96,79 @@ def _load_settings() -> dict:
 def _save_settings(data: dict) -> None:
     SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
     SETTINGS_FILE.write_text(json.dumps(data))
+
+
+def _spotify_url(uri: str) -> str:
+    parts = uri.split(":")
+    return f"https://open.spotify.com/track/{parts[2]}" if len(parts) == 3 and parts[:2] == ["spotify", "track"] else ""
+
+
+def _is_local_track(location: str) -> bool:
+    return urllib.parse.urlparse(location).scheme == "file"
+
+
+def _open_matches_db(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(path, timeout=5)
+    connection.execute("""CREATE TABLE IF NOT EXISTS track_matches (
+        location TEXT PRIMARY KEY,
+        local_artist TEXT NOT NULL,
+        local_title TEXT NOT NULL,
+        local_duration_ms INTEGER,
+        spotify_uri TEXT NOT NULL,
+        spotify_url TEXT NOT NULL,
+        spotify_title TEXT NOT NULL,
+        spotify_artists TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+    )""")
+    return connection
+
+
+def _load_match(location: str, artist: str, title: str,
+                duration_ms: Optional[int], path: Path = MATCHES_DB) -> Optional[dict]:
+    if not _is_local_track(location) or not path.exists():
+        return None
+    with closing(_open_matches_db(path)) as db, db:
+        row = db.execute("""SELECT local_artist, local_title, local_duration_ms,
+                            spotify_uri, spotify_url, spotify_title, spotify_artists
+                            FROM track_matches WHERE location = ?""", (location,)).fetchone()
+    if row is None or row[:3] != (artist, title, duration_ms):
+        return None
+    return {"uri": row[3], "external_urls": {"spotify": row[4]},
+            "name": row[5], "artists": [{"name": name} for name in json.loads(row[6])]}
+
+
+def _save_match(location: str, artist: str, title: str, duration_ms: Optional[int],
+                track: dict, path: Path = MATCHES_DB) -> None:
+    if not _is_local_track(location) or not track.get("uri"):
+        return
+    uri = track["uri"]
+    url = (track.get("external_urls") or {}).get("spotify") or _spotify_url(uri)
+    if not url:
+        raise ValueError("Spotify track URL is unavailable")
+    artists = [a.get("name", "") for a in track.get("artists", [])]
+    with closing(_open_matches_db(path)) as db, db:
+        db.execute("""INSERT INTO track_matches
+                    (location, local_artist, local_title, local_duration_ms,
+                     spotify_uri, spotify_url, spotify_title, spotify_artists, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(location) DO UPDATE SET
+                    local_artist=excluded.local_artist, local_title=excluded.local_title,
+                    local_duration_ms=excluded.local_duration_ms, spotify_uri=excluded.spotify_uri,
+                    spotify_url=excluded.spotify_url, spotify_title=excluded.spotify_title,
+                    spotify_artists=excluded.spotify_artists, updated_at=excluded.updated_at""",
+                   (location, artist, title, duration_ms, uri, url, track.get("name", ""),
+                    json.dumps(artists), int(time.time())))
+    print(f"[spotify_playlist] Saved match: {location!r} -> {url or uri}", flush=True)
+
+
+def _clear_matches(path: Path = MATCHES_DB) -> int:
+    if not path.exists():
+        return 0
+    with closing(_open_matches_db(path)) as db, db:
+        count = db.execute("SELECT COUNT(*) FROM track_matches").fetchone()[0]
+        db.execute("DELETE FROM track_matches")
+    return count
 
 
 def _clean_title(title: str) -> str:
@@ -565,7 +641,7 @@ class SpotifyPlaylistPlugin(GObject.Object, Peas.Activatable):
                          transient_for=window, modal=True)
         dlg.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
                         Gtk.STOCK_OK,     Gtk.ResponseType.OK)
-        dlg.set_default_size(440, 160)
+        dlg.set_default_size(500, 230)
 
         box  = dlg.get_content_area()
         grid = Gtk.Grid(column_spacing=12, row_spacing=8, margin=16)
@@ -581,13 +657,49 @@ class SpotifyPlaylistPlugin(GObject.Object, Peas.Activatable):
                                "<b>http://127.0.0.1:8888/callback</b>")
         grid.attach(note, 0, 1, 2, 1)
 
+        cache_enabled = Gtk.CheckButton(label="Remember selected Spotify tracks locally (SQLite)")
+        cache_enabled.set_active(self._settings.get("use_match_cache", False))
+        grid.attach(cache_enabled, 0, 2, 2, 1)
+
+        clear_button = Gtk.Button(label="Clear saved matches…")
+        grid.attach(clear_button, 0, 3, 2, 1)
+
+        def _confirm_clear(_button):
+            confirm = Gtk.MessageDialog(transient_for=dlg, modal=True,
+                                        message_type=Gtk.MessageType.QUESTION,
+                                        buttons=Gtk.ButtonsType.NONE,
+                                        text="Clear all saved track matches?")
+            confirm.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
+                                "Clear", Gtk.ResponseType.OK)
+            response = confirm.run()
+            confirm.destroy()
+            if response != Gtk.ResponseType.OK:
+                return
+            try:
+                count = _clear_matches()
+                print(f"[spotify_playlist] Cleared {count} saved matches", flush=True)
+                result = Gtk.MessageDialog(transient_for=dlg, modal=True,
+                                           message_type=Gtk.MessageType.INFO,
+                                           buttons=Gtk.ButtonsType.OK,
+                                           text=f"Cleared {count} saved matches.")
+                result.run(); result.destroy()
+            except (sqlite3.Error, OSError) as exc:
+                result = Gtk.MessageDialog(transient_for=dlg, modal=True,
+                                           message_type=Gtk.MessageType.ERROR,
+                                           buttons=Gtk.ButtonsType.OK,
+                                           text=f"Could not clear saved matches: {exc}")
+                result.run(); result.destroy()
+
+        clear_button.connect("clicked", _confirm_clear)
+
         dlg.show_all()
         if dlg.run() == Gtk.ResponseType.OK:
             cid = entry.get_text().strip()
+            self._settings["use_match_cache"] = cache_enabled.get_active()
             if cid:
                 self._settings["client_id"] = cid
-                _save_settings(self._settings)
                 self._build_client()
+            _save_settings(self._settings)
         dlg.destroy()
 
     def _on_auth(self, action, param) -> None:
@@ -628,11 +740,13 @@ class SpotifyPlaylistPlugin(GObject.Object, Peas.Activatable):
 
         artist = entry.get_string(RB.RhythmDBPropType.ARTIST) or ""
         title  = entry.get_string(RB.RhythmDBPropType.TITLE)  or ""
+        location = entry.get_string(RB.RhythmDBPropType.LOCATION) or ""
         try:
             duration_seconds = entry.get_ulong(RB.RhythmDBPropType.DURATION)
             duration_ms = duration_seconds * 1000 if duration_seconds else None
         except (AttributeError, TypeError, ValueError):
             duration_ms = None
+        local_match = (location, artist, title, duration_ms)
         window = self._shell.props.window
 
         wait = Gtk.MessageDialog(transient_for=window, modal=False,
@@ -643,11 +757,28 @@ class SpotifyPlaylistPlugin(GObject.Object, Peas.Activatable):
 
         def _search():
             try:
+                if self._settings.get("use_match_cache") and _is_local_track(location):
+                    try:
+                        cached = _load_match(*local_match)
+                    except (sqlite3.Error, OSError, ValueError) as exc:
+                        print(f"[spotify_playlist] Match cache read failed: {exc}", flush=True)
+                    else:
+                        if cached:
+                            GLib.idle_add(_got_cached, cached)
+                            return
+                        print(f"[spotify_playlist] Match cache miss: {location!r}", flush=True)
                 tracks = self._client.search_tracks(artist, title)
                 matches = _rank_candidates(tracks, artist, title, duration_ms)
                 GLib.idle_add(_got_matches, matches, None)
             except Exception as exc:
                 GLib.idle_add(_got_matches, [], str(exc))
+
+        def _got_cached(track):
+            wait.destroy()
+            print(f"[spotify_playlist] Cached match: {location!r} -> "
+                  f"{track.get('external_urls', {}).get('spotify') or track['uri']}", flush=True)
+            self._show_playlist_picker(track, add_to_last_id=add_to_last_id,
+                                       local_match=local_match)
 
         def _got_matches(matches, error):
             wait.destroy()
@@ -665,16 +796,15 @@ class SpotifyPlaylistPlugin(GObject.Object, Peas.Activatable):
             track = _automatic_match(matches)
             if track:
                 print(f"[spotify_playlist] Auto-selected exact match: {track['uri']}", flush=True)
-                self._show_playlist_picker(track["uri"], track["name"],
-                                           ", ".join(a["name"] for a in track["artists"]),
-                                           add_to_last_id=add_to_last_id)
+                self._show_playlist_picker(track, add_to_last_id=add_to_last_id,
+                                           local_match=local_match)
             else:
                 print("[spotify_playlist] User selection required: no unique exact match", flush=True)
-                self._show_track_picker(matches, add_to_last_id)
+                self._show_track_picker(matches, add_to_last_id, local_match)
 
         threading.Thread(target=_search, daemon=True).start()
 
-    def _show_track_picker(self, matches, add_to_last_id) -> None:
+    def _show_track_picker(self, matches, add_to_last_id, local_match) -> None:
         dlg = Gtk.Dialog(title="Choose Spotify track",
                          transient_for=self._shell.props.window, modal=True)
         dlg.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
@@ -709,16 +839,23 @@ class SpotifyPlaylistPlugin(GObject.Object, Peas.Activatable):
         track = matches[index][0]
         print(f"[spotify_playlist] User selected rank={index + 1}/{len(matches)} "
               f"uri={track['uri']!r}", flush=True)
-        self._show_playlist_picker(track["uri"], track["name"],
-                                   ", ".join(a["name"] for a in track["artists"]),
-                                   add_to_last_id=add_to_last_id)
+        self._show_playlist_picker(track, add_to_last_id=add_to_last_id,
+                                   local_match=local_match)
 
     # ------------------------------------------------------------------ playlist picker
 
-    def _show_playlist_picker(self, track_uri, title, artist, add_to_last_id=False) -> None:
+    def _show_playlist_picker(self, track, add_to_last_id=False, local_match=None) -> None:
         window = self._shell.props.window
+        track_uri = track["uri"]
+        title = track["name"]
+        artist = ", ".join(a.get("name", "") for a in track.get("artists", []))
 
         def _done(ok, pname):
+            if ok and local_match and self._settings.get("use_match_cache"):
+                try:
+                    _save_match(*local_match, track)
+                except (sqlite3.Error, OSError, ValueError) as exc:
+                    print(f"[spotify_playlist] Match cache write failed: {exc}", flush=True)
             if not ok:
                 d = Gtk.MessageDialog(
                     transient_for=window, modal=True,

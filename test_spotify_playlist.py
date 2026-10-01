@@ -1,6 +1,10 @@
 import contextlib
 import io
+import sqlite3
+import tempfile
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import spotify_playlist as plugin
@@ -151,6 +155,73 @@ class MatchingTests(unittest.TestCase):
 
         self.assertEqual(get.call_args_list[0].kwargs["params"]["q"],
                          "artist:artist 1 track:Song")
+
+
+class MatchCacheTests(unittest.TestCase):
+    def test_selected_track_round_trip_and_clear(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "matches.sqlite3"
+            chosen = track("spotify:track:abc123", "Song", "Artist")
+            chosen["external_urls"] = {"spotify": "https://open.spotify.com/track/abc123"}
+            self.assertIsNone(plugin._load_match("file:///song.ogg", "Artist", "Song", 180000, path))
+            self.assertFalse(path.exists())
+
+            plugin._save_match("file:///song.ogg", "Artist", "Song", 180000, chosen, path)
+            cached = plugin._load_match("file:///song.ogg", "Artist", "Song", 180000, path)
+            self.assertEqual(cached["uri"], chosen["uri"])
+            self.assertEqual(cached["external_urls"]["spotify"],
+                             "https://open.spotify.com/track/abc123")
+            self.assertEqual(cached["artists"], [{"name": "Artist"}])
+            self.assertIsNone(plugin._load_match("file:///song.ogg", "Artist", "Song (Live)", 180000, path))
+            self.assertIsNone(plugin._load_match("file:///song.ogg", "Artist", "Song", 200000, path))
+            self.assertIsNone(plugin._load_match("file:///other.ogg", "Artist", "Song", 180000, path))
+            self.assertEqual(plugin._clear_matches(path), 1)
+            self.assertIsNone(plugin._load_match("file:///song.ogg", "Artist", "Song", 180000, path))
+            self.assertEqual(plugin._clear_matches(path), 0)
+
+    def test_saving_same_local_track_replaces_only_its_selected_match(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "matches.sqlite3"
+            first = track("spotify:track:first", "Song", "Artist")
+            second = track("spotify:track:second", "Song", "Artist")
+            plugin._save_match("file:///song.ogg", "Artist", "Song", 180000, first, path)
+            plugin._save_match("file:///song.ogg", "Artist", "Song", 180000, second, path)
+            with sqlite3.connect(path) as db:
+                rows = db.execute("SELECT spotify_uri, spotify_url FROM track_matches").fetchall()
+            self.assertEqual(rows, [("spotify:track:second",
+                                     "https://open.spotify.com/track/second")])
+
+    def test_streams_are_not_cached_as_local_tracks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "matches.sqlite3"
+            plugin._save_match("https://radio.example/stream", "Artist", "Song",
+                               None, track("spotify:track:abc", "Song", "Artist"), path)
+            self.assertFalse(path.exists())
+
+    def test_only_successfully_added_selection_is_saved(self):
+        selected = track("spotify:track:chosen", "Song", "Artist")
+        local = ("file:///song.ogg", "Artist", "Song", 180000)
+        client = SimpleNamespace(add_to_playlist=lambda _playlist, _uri: True)
+        subject = SimpleNamespace(
+            _shell=SimpleNamespace(props=SimpleNamespace(window=None)),
+            _client=client, _settings={"use_match_cache": True},
+            _last_pid="playlist", _last_playlist="Playlist")
+        with patch.object(plugin.GLib, "idle_add", side_effect=lambda callback, *args: callback(*args)), \
+             patch.object(plugin, "_save_match") as save:
+            plugin.SpotifyPlaylistPlugin._show_playlist_picker(
+                subject, selected, add_to_last_id=True, local_match=local)
+            save.assert_called_once_with(*local, selected)
+            save.reset_mock()
+            subject._settings["use_match_cache"] = False
+            plugin.SpotifyPlaylistPlugin._show_playlist_picker(
+                subject, selected, add_to_last_id=True, local_match=local)
+            save.assert_not_called()
+            subject._settings["use_match_cache"] = True
+            subject._client.add_to_playlist = lambda _playlist, _uri: False
+            with patch.object(plugin.Gtk, "MessageDialog"):
+                plugin.SpotifyPlaylistPlugin._show_playlist_picker(
+                    subject, selected, add_to_last_id=True, local_match=local)
+            save.assert_not_called()
 
 
 if __name__ == "__main__":

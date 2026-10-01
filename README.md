@@ -43,3 +43,11 @@ artist, and duration scores, the duration difference, total score, and whether
 the match can be selected automatically.
 When both durations are known, the score weights are 50% title, 30% artists,
 and 20% duration; automatic matching allows at most a two-second difference.
+
+In **Spotify preferences**, enable **Remember selected Spotify tracks locally
+(SQLite)** to reuse a saved match before searching Spotify. The plugin saves
+only the track successfully added to a playlist, keyed by the local track's
+location and checked against its current title, artists, and duration. The
+SQLite file is `~/.config/rhythmbox/spotify_playlist_matches.sqlite3` and
+stores the Spotify track URI and URL. **Clear saved matches…** removes all
+saved matches; this works even when the setting is off.
