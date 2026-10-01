@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import spotify_playlist as plugin
 
@@ -66,11 +66,43 @@ class MatchingTests(unittest.TestCase):
         self.assertFalse(plugin._candidate_match(
             candidate, "Artist 2", "Song", None)[1])
 
-    def test_multiple_exact_recordings_require_user_choice(self):
+    def test_multiple_exact_recordings_choose_first_ranked(self):
         first = track("first", "Song", "Artist")
         second = track("second", "Song", "Artist")
         matches = plugin._rank_candidates([first, second], "Artist", "Song", None)
-        self.assertIsNone(plugin._automatic_match(matches))
+        self.assertEqual(plugin._automatic_match(matches), first)
+
+    def test_multiple_exact_results_skip_track_chooser(self):
+        entry = Mock()
+        entry.get_string.side_effect = lambda prop: {
+            plugin.RB.RhythmDBPropType.ARTIST: "Artist",
+            plugin.RB.RhythmDBPropType.TITLE: "Song",
+            plugin.RB.RhythmDBPropType.LOCATION: "file:///song.ogg",
+        }[prop]
+        entry.get_ulong.return_value = 180
+        subject = SimpleNamespace(
+            _ensure_client=lambda: True, _ensure_authenticated=lambda: True,
+            _get_selected_entry=lambda: entry,
+            _shell=SimpleNamespace(props=SimpleNamespace(window=None)),
+            _settings={"use_match_cache": False},
+            _client=SimpleNamespace(search_tracks=lambda _artist, _title: [
+                track("first", "Song", "Artist"), track("second", "Song", "Artist")]),
+            _show_error=Mock(), _show_playlist_picker=Mock(), _show_track_picker=Mock())
+
+        class ImmediateThread:
+            def __init__(self, target, **_kwargs):
+                self.target = target
+
+            def start(self):
+                self.target()
+
+        with patch.object(plugin.Gtk, "MessageDialog"), \
+             patch.object(plugin.GLib, "idle_add", side_effect=lambda callback, *args: callback(*args)), \
+             patch.object(plugin.threading, "Thread", ImmediateThread):
+            plugin.SpotifyPlaylistPlugin._on_add_to_playlist(subject, None, None)
+
+        subject._show_track_picker.assert_not_called()
+        self.assertEqual(subject._show_playlist_picker.call_args.args[0]["uri"], "first")
 
     def test_duration_mismatch_requires_user_choice(self):
         candidate = track("long", "Song", "Artist", duration_ms=220000)
@@ -108,7 +140,7 @@ class MatchingTests(unittest.TestCase):
         matches = plugin._rank_candidates(
             [two_seconds, exact_length], "Artist", "Song", 180000)
         self.assertEqual([item[0]["uri"] for item in matches], ["zero", "two"])
-        self.assertIsNone(plugin._automatic_match(matches))
+        self.assertEqual(plugin._automatic_match(matches), exact_length)
 
     def test_three_second_difference_requires_choice(self):
         candidate = track("three", "Song", "Artist", duration_ms=183000)

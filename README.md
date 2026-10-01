@@ -33,9 +33,9 @@ Then in Rhythmbox:
 
 The plugin compares tracks from the first page of Spotify search results by
 title, all credited artists (including trailing `feat.` credits in the title),
-and duration when available. It continues
-automatically only when exactly one result has an exact title and artist match
-with a compatible duration. Otherwise, choose the recording from the ranked
+and duration when available. If any result has an exact title and artist match
+with a compatible duration, the first ranked exact result is selected without
+opening the track chooser. Otherwise, choose the recording from the ranked
 list before adding it to a playlist.
 
 The Rhythmbox console logs every candidate in ranked order with separate title,

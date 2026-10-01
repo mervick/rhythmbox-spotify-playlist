@@ -290,8 +290,7 @@ def _rank_candidates(tracks: list[dict], artist: str, title: str,
 
 
 def _automatic_match(matches: list[tuple[dict, float, bool]]) -> Optional[dict]:
-    exact = [track for track, _, is_exact in matches if is_exact]
-    return exact[0] if len(exact) == 1 else None
+    return next((track for track, _, is_exact in matches if is_exact), None)
 
 
 # ---------------------------------------------------------------------------
@@ -799,7 +798,7 @@ class SpotifyPlaylistPlugin(GObject.Object, Peas.Activatable):
                 self._show_playlist_picker(track, add_to_last_id=add_to_last_id,
                                            local_match=local_match)
             else:
-                print("[spotify_playlist] User selection required: no unique exact match", flush=True)
+                print("[spotify_playlist] User selection required: no exact match", flush=True)
                 self._show_track_picker(matches, add_to_last_id, local_match)
 
         threading.Thread(target=_search, daemon=True).start()
