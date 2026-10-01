@@ -62,6 +62,7 @@ MATCHES_DB         = Path.home() / ".config" / "rhythmbox" / "spotify_playlist_m
 # ---------------------------------------------------------------------------
 
 def _pkce_pair() -> tuple[str, str]:
+    """Generate a PKCE verifier and its SHA-256 challenge."""
     verifier  = secrets.token_urlsafe(64)[:128]
     digest    = hashlib.sha256(verifier.encode()).digest()
     challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
@@ -73,12 +74,14 @@ def _pkce_pair() -> tuple[str, str]:
 # ---------------------------------------------------------------------------
 
 def _load_token() -> dict:
+    """Read the saved Spotify token, returning an empty dict on failure."""
     try:
         return json.loads(TOKEN_CACHE.read_text())
     except Exception:
         return {}
 
 def _save_token(data: dict) -> None:
+    """Persist Spotify token data in the Rhythmbox config directory."""
     TOKEN_CACHE.parent.mkdir(parents=True, exist_ok=True)
     TOKEN_CACHE.write_text(json.dumps(data))
 
@@ -88,26 +91,32 @@ def _save_token(data: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def _load_settings() -> dict:
+    """Read plugin settings, returning an empty dict on failure."""
     try:
         return json.loads(SETTINGS_FILE.read_text())
     except Exception:
         return {}
 
 def _save_settings(data: dict) -> None:
+    """Persist plugin settings in the Rhythmbox config directory."""
     SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
     SETTINGS_FILE.write_text(json.dumps(data))
 
 
 def _spotify_url(uri: str) -> str:
+    """Build a web URL from a Spotify track URI when valid."""
     parts = uri.split(":")
     return f"https://open.spotify.com/track/{parts[2]}" if len(parts) == 3 and parts[:2] == ["spotify", "track"] else ""
 
 
 def _is_local_track(location: str) -> bool:
+    """Check whether a track location uses the file URI scheme."""
     return urllib.parse.urlparse(location).scheme == "file"
 
 
+# Keep one confirmed Spotify match per local file; search candidates never enter this database.
 def _open_matches_db(path: Path):
+    """Open the local match database and ensure its table exists."""
     path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(path, timeout=5)
     connection.execute("""CREATE TABLE IF NOT EXISTS track_matches (
@@ -126,12 +135,14 @@ def _open_matches_db(path: Path):
 
 def _load_match(location: str, artist: str, title: str,
                 duration_ms: Optional[int], path: Path = MATCHES_DB) -> Optional[dict]:
+    """Return a saved match only when the local track metadata still agrees."""
     if not _is_local_track(location) or not path.exists():
         return None
     with closing(_open_matches_db(path)) as db, db:
         row = db.execute("""SELECT local_artist, local_title, local_duration_ms,
                             spotify_uri, spotify_url, spotify_title, spotify_artists
                             FROM track_matches WHERE location = ?""", (location,)).fetchone()
+    # A file can be retagged or replaced at the same location, so verify its metadata too.
     if row is None or row[:3] != (artist, title, duration_ms):
         return None
     return {"uri": row[3], "external_urls": {"spotify": row[4]},
@@ -140,6 +151,7 @@ def _load_match(location: str, artist: str, title: str,
 
 def _save_match(location: str, artist: str, title: str, duration_ms: Optional[int],
                 track: dict, path: Path = MATCHES_DB) -> None:
+    """Store the confirmed Spotify track for a local file."""
     if not _is_local_track(location) or not track.get("uri"):
         return
     uri = track["uri"]
@@ -163,6 +175,7 @@ def _save_match(location: str, artist: str, title: str, duration_ms: Optional[in
 
 
 def _clear_matches(path: Path = MATCHES_DB) -> int:
+    """Delete all saved track matches and return the deleted count."""
     if not path.exists():
         return 0
     with closing(_open_matches_db(path)) as db, db:
@@ -183,6 +196,7 @@ def _normalize(s: str) -> str:
 
 
 def _artist_names(value: str) -> list[str]:
+    """Split and normalize the artist names in a credit field."""
     parts = re.split(r"\s*(?:,|;|\s+[&×x]\s+|\s+(?:feat|ft|featuring)\.?\s+)\s*", value or "", flags=re.IGNORECASE)
     return [name for part in parts if (name := _normalize(part))]
 
@@ -190,6 +204,7 @@ def _artist_names(value: str) -> list[str]:
 def _split_title_credit(title: str) -> tuple[str, str]:
     """Extract only an explicit trailing feat/ft/featuring credit."""
     title = title or ""
+    # Limit extraction to a trailing credit so version labels such as "Live" remain in the title.
     match = re.match(r"^(.*?)\s*[\(\[]\s*(?:feat|ft|featuring|with)\.?\s+(.+?)\s*[\)\]]\s*$",
                      title, flags=re.IGNORECASE)
     if not match:
@@ -201,6 +216,8 @@ def _split_title_credit(title: str) -> tuple[str, str]:
 
 
 def _credits(artist_fields: list[str], title: str) -> list[str]:
+    # The same guest may appear in both the title and artist fields; count that artist once.
+    """Collect unique normalized artists from fields and title credits."""
     names = set()
     for field in artist_fields + [_split_title_credit(title)[1]]:
         names.update(_artist_names(field))
@@ -238,6 +255,8 @@ def _match_details(candidate: dict, want_artist: str, want_title: str,
         else:
             duration_score = 0.0
 
+    # Missing source duration leaves name matching at full weight; missing Spotify duration
+    # loses the duration component and prevents an automatic match below.
     if duration_ms is None:
         score = 0.6 * title_score + 0.4 * artist_score
     else:
@@ -257,13 +276,16 @@ def _match_details(candidate: dict, want_artist: str, want_title: str,
 
 def _candidate_match(candidate: dict, want_artist: str, want_title: str,
                      duration_ms: Optional[int]) -> tuple[float, bool]:
+    """Return the score and exact-match flag for one candidate."""
     details = _match_details(candidate, want_artist, want_title, duration_ms)
     return details["score"], details["exact"]
 
 
 def _rank_candidates(tracks: list[dict], artist: str, title: str,
                      duration_ms: Optional[int]) -> list[tuple[dict, float, bool]]:
+    """Rank Spotify tracks and log the scoring details."""
     ranked = [(track, _match_details(track, artist, title, duration_ms)) for track in tracks]
+    # Exact matches lead; score and then duration difference order ties.
     ranked.sort(key=lambda item: (item[1]["exact"], item[1]["score"],
                                   -(item[1]["duration_delta_ms"]
                                     if item[1]["duration_delta_ms"] is not None else float("inf"))),
@@ -290,6 +312,8 @@ def _rank_candidates(tracks: list[dict], artist: str, title: str,
 
 
 def _automatic_match(matches: list[tuple[dict, float, bool]]) -> Optional[dict]:
+    # The list is already ranked, so the first exact match needs no track-choice dialog.
+    """Return the first exact match from ranked candidates, if any."""
     return next((track for track, _, is_exact in matches if is_exact), None)
 
 
@@ -299,13 +323,16 @@ def _automatic_match(matches: list[tuple[dict, float, bool]]) -> Optional[dict]:
 
 class SpotifyClient:
     def __init__(self, client_id: str) -> None:
+        """Initialize the Spotify client with a client ID and saved token."""
         self.client_id = client_id
         self._token: dict = _load_token()
 
     def is_authenticated(self) -> bool:
+        """Check whether a saved access token is present."""
         return bool(self._token.get("access_token"))
 
     def access_token(self) -> Optional[str]:
+        """Return a current access token, refreshing it when expired."""
         if not self._token:
             return None
         if self._is_expired():
@@ -313,9 +340,11 @@ class SpotifyClient:
         return self._token.get("access_token")
 
     def _is_expired(self) -> bool:
+        """Check whether the access token is expired or nearly expired."""
         return time.time() > self._token.get("expires_at", 0) - 30
 
     def _refresh(self) -> None:
+        """Refresh the access token or clear unusable token data."""
         rt = self._token.get("refresh_token")
         if not rt:
             self._token = {}
@@ -335,6 +364,7 @@ class SpotifyClient:
             self._token = {}
 
     def start_auth_flow(self, on_done) -> None:
+        """Start browser-based PKCE authorization and report the result."""
         verifier, challenge = _pkce_pair()
         state = secrets.token_hex(8)
         params = {
@@ -349,11 +379,15 @@ class SpotifyClient:
         webbrowser.open(SPOTIFY_AUTH_URL + "?" + urllib.parse.urlencode(params))
 
         def _serve():
+            """Handle the local OAuth callback and exchange its code for a token."""
             code_holder = []
 
             class _H(BaseHTTPRequestHandler):
-                def log_message(self, *_): pass
+                def log_message(self, *_):
+                    """Suppress HTTP server request logging during authorization."""
+                    pass
                 def do_GET(self):
+                    """Validate the OAuth callback and acknowledge it in the browser."""
                     qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                     if qs.get("state", [""])[0] == state and "code" in qs:
                         code_holder.append(qs["code"][0])
@@ -390,6 +424,7 @@ class SpotifyClient:
         threading.Thread(target=_serve, daemon=True).start()
 
     def get_playlists(self) -> list[dict]:
+        """Fetch every available page of the current user’s playlists."""
         tok = self.access_token()
         if not tok:
             return []
@@ -404,6 +439,7 @@ class SpotifyClient:
         return result
 
     def search_tracks(self, artist: str, title: str) -> list[dict]:
+        """Search Spotify with two queries and deduplicate tracks by URI."""
         tok = self.access_token()
         if not tok:
             return []
@@ -431,6 +467,7 @@ class SpotifyClient:
         return list(tracks.values())
 
     def add_to_playlist(self, playlist_id: str, track_uri: str) -> bool:
+        """Add a Spotify track URI to the specified playlist."""
         tok = self.access_token()
         if not tok:
             return False
@@ -451,6 +488,7 @@ class SpotifyPlaylistPlugin(GObject.Object, Peas.Activatable):
     object = GObject.Property(type=GObject.Object)
 
     def __init__(self) -> None:
+        """Initialize plugin state and load persisted settings."""
         super().__init__()
         self._last_pid = None
         self._last_playlist = None
@@ -463,6 +501,7 @@ class SpotifyPlaylistPlugin(GObject.Object, Peas.Activatable):
     # ------------------------------------------------------------------ lifecycle
 
     def do_activate(self) -> None:
+        """Register actions and add the Spotify menu when the plugin activates."""
         if not HAS_REQUESTS:
             print("[spotify_playlist] ERROR: 'requests' not installed. "
                   "Run: pip3 install --user requests")
@@ -490,6 +529,7 @@ class SpotifyPlaylistPlugin(GObject.Object, Peas.Activatable):
         self._inject_menu(app)
 
     def do_deactivate(self) -> None:
+        """Remove plugin UI and release client state on deactivation."""
         app = Gio.Application.get_default()
         self._remove_menu(app)
         for name in ("spotify-add-to-playlist", "spotify-connect",
@@ -503,6 +543,7 @@ class SpotifyPlaylistPlugin(GObject.Object, Peas.Activatable):
     # ------------------------------------------------------------------ actions
 
     def _register_app_action(self, app, name: str, callback) -> None:
+        """Register an application action and retain its reference."""
         action = Gio.SimpleAction.new(name, None)
         action.connect("activate", callback)
         app.add_action(action)
@@ -599,6 +640,7 @@ class SpotifyPlaylistPlugin(GObject.Object, Peas.Activatable):
         # Gio.Menu items added via append_section can be removed by index,
         # but it's complex to track. Simplest: just leave them — on deactivate
         # Rhythmbox will reload anyway. For cleanliness, try remove:
+        """Remove Spotify menu UI where the host menu permits it."""
         try:
             menubar = app.get_menubar()
             if menubar:
@@ -615,6 +657,7 @@ class SpotifyPlaylistPlugin(GObject.Object, Peas.Activatable):
             pass
 
     def _remove_section_from_model(self, model, section_label, depth=0):
+        """Find and remove a labeled section from a menu model."""
         if depth > 5:
             return
         n = model.get_n_items()
@@ -635,6 +678,7 @@ class SpotifyPlaylistPlugin(GObject.Object, Peas.Activatable):
     # ------------------------------------------------------------------ handlers
 
     def _on_preferences(self, action, param) -> None:
+        """Show preferences and save the selected plugin settings."""
         window = self._shell.props.window
         dlg = Gtk.Dialog(title="Spotify Playlist — Preferences",
                          transient_for=window, modal=True)
@@ -664,6 +708,7 @@ class SpotifyPlaylistPlugin(GObject.Object, Peas.Activatable):
         grid.attach(clear_button, 0, 3, 2, 1)
 
         def _confirm_clear(_button):
+            """Confirm deletion of saved track matches and show the result."""
             confirm = Gtk.MessageDialog(transient_for=dlg, modal=True,
                                         message_type=Gtk.MessageType.QUESTION,
                                         buttons=Gtk.ButtonsType.NONE,
@@ -702,6 +747,7 @@ class SpotifyPlaylistPlugin(GObject.Object, Peas.Activatable):
         dlg.destroy()
 
     def _on_auth(self, action, param) -> None:
+        """Prompt for Spotify authorization and start the browser flow."""
         if not self._ensure_client():
             return
         window = self._shell.props.window
@@ -713,6 +759,7 @@ class SpotifyPlaylistPlugin(GObject.Object, Peas.Activatable):
         d.run(); d.destroy()
 
         def _done(success: bool):
+            """Show the result of Spotify authorization."""
             msg = ("✓ Spotify connected!" if success
                    else "Authorization failed. Check your Client ID.")
             d2 = Gtk.MessageDialog(
@@ -724,11 +771,13 @@ class SpotifyPlaylistPlugin(GObject.Object, Peas.Activatable):
         self._client.start_auth_flow(_done)
 
     def _on_add_to_playlist_last(self, action, param) -> None:
+        """Add the selected track using the last chosen playlist."""
         self._on_add_to_playlist(action, param, add_to_last_id=True)
 
 
     # def _on_add_to_playlist(self, action, param, add_to_last_id=False) -> None:
     def _on_add_to_playlist(self, action, param, add_to_last_id=True) -> None:
+        """Resolve the selected Rhythmbox track to a Spotify track."""
         if not self._ensure_client() or not self._ensure_authenticated():
             return
 
@@ -755,7 +804,9 @@ class SpotifyPlaylistPlugin(GObject.Object, Peas.Activatable):
         wait.show()
 
         def _search():
+            """Use a saved match or search and rank Spotify candidates."""
             try:
+                # A valid saved match skips Spotify search only when the option is enabled.
                 if self._settings.get("use_match_cache") and _is_local_track(location):
                     try:
                         cached = _load_match(*local_match)
@@ -773,6 +824,7 @@ class SpotifyPlaylistPlugin(GObject.Object, Peas.Activatable):
                 GLib.idle_add(_got_matches, [], str(exc))
 
         def _got_cached(track):
+            """Continue with a saved Spotify match on the GTK thread."""
             wait.destroy()
             print(f"[spotify_playlist] Cached match: {location!r} -> "
                   f"{track.get('external_urls', {}).get('spotify') or track['uri']}", flush=True)
@@ -780,6 +832,7 @@ class SpotifyPlaylistPlugin(GObject.Object, Peas.Activatable):
                                        local_match=local_match)
 
         def _got_matches(matches, error):
+            """Handle search results and choose automatic or manual selection."""
             wait.destroy()
             if error:
                 print(f"[spotify_playlist] Spotify search failed: {error}", flush=True)
@@ -804,6 +857,7 @@ class SpotifyPlaylistPlugin(GObject.Object, Peas.Activatable):
         threading.Thread(target=_search, daemon=True).start()
 
     def _show_track_picker(self, matches, add_to_last_id, local_match) -> None:
+        """Let the user choose a Spotify track from ranked candidates."""
         dlg = Gtk.Dialog(title="Choose Spotify track",
                          transient_for=self._shell.props.window, modal=True)
         dlg.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
@@ -844,12 +898,15 @@ class SpotifyPlaylistPlugin(GObject.Object, Peas.Activatable):
     # ------------------------------------------------------------------ playlist picker
 
     def _show_playlist_picker(self, track, add_to_last_id=False, local_match=None) -> None:
+        """Add the track to the last playlist or let the user choose one."""
         window = self._shell.props.window
         track_uri = track["uri"]
         title = track["name"]
         artist = ", ".join(a.get("name", "") for a in track.get("artists", []))
 
         def _done(ok, pname):
+            # Persist only the chosen track, and only after Spotify accepts the playlist add.
+            """Save a successful match or show the playlist add error."""
             if ok and local_match and self._settings.get("use_match_cache"):
                 try:
                     _save_match(*local_match, track)
@@ -876,10 +933,12 @@ class SpotifyPlaylistPlugin(GObject.Object, Peas.Activatable):
         wait.show()
 
         def _fetch():
+            """Fetch playlists in a worker thread before showing the picker."""
             playlists = self._client.get_playlists()
             GLib.idle_add(_show, playlists)
 
         def _show(playlists):
+            """Display playlists and start adding to the chosen one."""
             wait.destroy()
             if not playlists:
                 self._show_error("No playlists",
@@ -926,6 +985,7 @@ class SpotifyPlaylistPlugin(GObject.Object, Peas.Activatable):
             self._last_playlist = pname
 
             def _add():
+                """Add the track to the chosen playlist in a worker thread."""
                 ok = self._client.add_to_playlist(pid, track_uri)
                 GLib.idle_add(_done, ok, pname)
 
@@ -951,10 +1011,12 @@ class SpotifyPlaylistPlugin(GObject.Object, Peas.Activatable):
             return None
 
     def _build_client(self) -> None:
+        """Create a Spotify client when a client ID is configured."""
         cid = self._settings.get("client_id", "")
         self._client = SpotifyClient(cid) if cid else None
 
     def _ensure_client(self) -> bool:
+        """Require a configured Spotify client, showing an error if absent."""
         if self._client:
             return True
         self._show_error("Not configured",
@@ -963,6 +1025,7 @@ class SpotifyPlaylistPlugin(GObject.Object, Peas.Activatable):
         return False
 
     def _ensure_authenticated(self) -> bool:
+        """Require a saved Spotify login, showing an error if absent."""
         if self._client and self._client.is_authenticated():
             return True
         self._show_error("Not connected",
@@ -971,6 +1034,7 @@ class SpotifyPlaylistPlugin(GObject.Object, Peas.Activatable):
         return False
 
     def _show_error(self, title: str, markup: str) -> None:
+        """Display an error dialog with escaped title and supplied markup."""
         window = self._shell.props.window if self._shell else None
         d = Gtk.MessageDialog(transient_for=window, modal=True,
                               message_type=Gtk.MessageType.ERROR,
