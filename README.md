@@ -31,11 +31,11 @@ Then in Rhythmbox:
 4. Authorize, return to Rhythmbox
 5. Select one or more songs → **Tools → Add to Spotify playlist…**
 
-When multiple songs are selected, the plugin matches them in order. A track
-chooser opens for each song without an exact match. Cancel that chooser to
-skip that song. After matching, choose a playlist once; the plugin adds the
-matched songs in selection order. The result is logged to the Rhythmbox console;
-an error dialog appears if no tracks could be added.
+Choose a playlist first. The plugin then matches the selected songs in order.
+A track chooser opens for each song without an exact match. Cancel that chooser
+to skip that song. Matched songs are added in selection order. The result is
+logged to the Rhythmbox console; an error dialog appears if no tracks could be
+added.
 
 The plugin compares tracks from the first page of Spotify search results by
 title, all credited artists (including trailing `feat.` credits in the title),

@@ -89,16 +89,29 @@ class MatchingTests(unittest.TestCase):
             plugin.RB.RhythmDBPropType.LOCATION: "file:///song.ogg",
         }[prop]
         entry.get_ulong.return_value = 180
+        events = []
+
+        def choose_playlist(_track, **kwargs):
+            events.append("choose playlist")
+            kwargs["on_playlist"]("playlist", "My playlist")
+
+        def search(_artist, _title):
+            events.append("search")
+            return [track("first", "Song", "Artist"),
+                    track("second", "Song", "Artist")]
+
         subject = SimpleNamespace(
             _ensure_client=lambda: True, _ensure_authenticated=lambda: True,
             _get_selected_entries=lambda: [entry],
             _entry_metadata=lambda selected: plugin.SpotifyPlaylistPlugin._entry_metadata(
                 subject, selected),
+            _add_selected_tracks=lambda entries, last: plugin.SpotifyPlaylistPlugin._add_selected_tracks(
+                subject, entries, last),
             _shell=SimpleNamespace(props=SimpleNamespace(window=None)),
             _settings={"use_match_cache": False},
-            _client=SimpleNamespace(search_tracks=lambda _artist, _title: [
-                track("first", "Song", "Artist"), track("second", "Song", "Artist")]),
-            _show_error=Mock(), _show_playlist_picker=Mock(), _show_track_picker=Mock())
+            _client=SimpleNamespace(search_tracks=search),
+            _show_error=Mock(), _show_playlist_picker=Mock(side_effect=choose_playlist),
+            _show_track_picker=Mock(), _add_resolved_tracks=Mock())
 
         class ImmediateThread:
             def __init__(self, target, **_kwargs):
@@ -113,7 +126,11 @@ class MatchingTests(unittest.TestCase):
             plugin.SpotifyPlaylistPlugin._on_add_to_playlist(subject, None, None)
 
         subject._show_track_picker.assert_not_called()
-        self.assertEqual(subject._show_playlist_picker.call_args.args[0]["uri"], "first")
+        self.assertEqual(events, ["choose playlist", "search"])
+        self.assertIsNone(subject._show_playlist_picker.call_args.args[0])
+        self.assertFalse(subject._show_playlist_picker.call_args.kwargs["add_to_last_id"])
+        resolved = subject._add_resolved_tracks.call_args.args[0]
+        self.assertEqual(resolved[0][0]["uri"], "first")
 
     def test_multiple_selected_tracks_use_one_playlist_and_keep_selection_order(self):
         def entry(title):
@@ -130,14 +147,21 @@ class MatchingTests(unittest.TestCase):
         second = track("spotify:track:second", "Second", "Artist")
         searched = []
         added = []
+        events = []
 
         def search(_artist, title):
             searched.append(title)
+            events.append(f"search {title}")
             return [first if title == "First" else second]
 
         def add(_playlist, uri):
             added.append(uri)
+            events.append(f"add {uri}")
             return True
+
+        def choose_playlist(_track, **kwargs):
+            events.append("choose playlist")
+            kwargs["on_playlist"]("playlist", "My playlist")
 
         class ImmediateThread:
             def __init__(self, target, **_kwargs):
@@ -156,8 +180,7 @@ class MatchingTests(unittest.TestCase):
             _add_resolved_tracks=lambda resolved, skipped, pid, pname:
                 plugin.SpotifyPlaylistPlugin._add_resolved_tracks(
                     subject, resolved, skipped, pid, pname),
-            _show_playlist_picker=Mock(side_effect=lambda _track, **kwargs:
-                                       kwargs["on_playlist"]("playlist", "My playlist")),
+            _show_playlist_picker=Mock(side_effect=choose_playlist),
             _show_track_picker=Mock(), _show_error=Mock(),
             _shell=SimpleNamespace(props=SimpleNamespace(window=None)),
             _settings={"use_match_cache": True},
@@ -171,14 +194,38 @@ class MatchingTests(unittest.TestCase):
 
         self.assertEqual(searched, ["First", "Second"])
         self.assertEqual(added, ["spotify:track:first", "spotify:track:second"])
+        self.assertEqual(events, ["choose playlist", "search First", "search Second",
+                                  "add spotify:track:first", "add spotify:track:second"])
         subject._show_playlist_picker.assert_called_once()
         self.assertEqual(subject._show_playlist_picker.call_args.kwargs["track_count"], 2)
+        self.assertFalse(subject._show_playlist_picker.call_args.kwargs["add_to_last_id"])
         subject._show_track_picker.assert_not_called()
         subject._show_error.assert_not_called()
         self.assertEqual(save.call_count, 2)
         dialog.assert_called()
         self.assertTrue(all("Added" not in call.kwargs.get("text", "")
                             for call in dialog.call_args_list))
+
+    def test_cancelled_playlist_selection_does_not_search_or_add(self):
+        entry = Mock()
+        entry.get_string.return_value = "Song"
+        entry.get_ulong.return_value = 180
+        subject = SimpleNamespace(
+            _ensure_client=lambda: True, _ensure_authenticated=lambda: True,
+            _get_selected_entries=lambda: [entry],
+            _entry_metadata=lambda selected: plugin.SpotifyPlaylistPlugin._entry_metadata(
+                subject, selected),
+            _add_selected_tracks=lambda entries, last: plugin.SpotifyPlaylistPlugin._add_selected_tracks(
+                subject, entries, last),
+            _show_playlist_picker=Mock(), _add_resolved_tracks=Mock(),
+            _shell=SimpleNamespace(props=SimpleNamespace(window=None)),
+            _client=SimpleNamespace(search_tracks=Mock()))
+
+        plugin.SpotifyPlaylistPlugin._on_add_to_playlist(subject, None, None)
+
+        subject._show_playlist_picker.assert_called_once()
+        subject._client.search_tracks.assert_not_called()
+        subject._add_resolved_tracks.assert_not_called()
 
     def test_batch_add_skips_failed_tracks_and_caches_only_successes(self):
         first = track("spotify:track:first", "First", "Artist")
