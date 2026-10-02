@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import DEFAULT, Mock, patch
 
 import spotify_playlist as plugin
 
@@ -338,6 +338,23 @@ class MatchingTests(unittest.TestCase):
         matches = plugin._rank_candidates([candidate], "Artist", "Song", 180000)
         self.assertIsNone(plugin._automatic_match(matches))
         self.assertLess(matches[0][1], 100)
+
+    def test_track_picker_shows_local_title_and_artist(self):
+        subject = SimpleNamespace(_shell=SimpleNamespace(props=SimpleNamespace(window=None)))
+        local = ("file:///song.ogg", "Local Artist", "Local Title", 180000)
+        matches = [(track("candidate", "Spotify Title", "Spotify Artist"), 90.0, False)]
+        with patch.multiple(plugin.Gtk, Dialog=DEFAULT, Label=DEFAULT, ListStore=DEFAULT,
+                            TreeView=DEFAULT, ScrolledWindow=DEFAULT,
+                            TreeViewColumn=DEFAULT, CellRendererText=DEFAULT) as widgets:
+            widgets["Dialog"].return_value.run.return_value = plugin.Gtk.ResponseType.CANCEL
+            widgets["TreeView"].return_value.get_selection.return_value.get_selected.return_value = (
+                None, None)
+            plugin.SpotifyPlaylistPlugin._show_track_picker(
+                subject, matches, False, local, on_selected=Mock())
+
+        label = widgets["Label"].call_args.kwargs["label"]
+        self.assertIn("Title: Local Title", label)
+        self.assertIn("Artist: Local Artist", label)
 
     def test_duration_breaks_name_tie_and_logs_every_rank(self):
         wrong_length = track("long", "Song", "Artist", duration_ms=220000)
