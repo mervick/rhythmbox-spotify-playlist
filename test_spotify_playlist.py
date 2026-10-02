@@ -339,7 +339,7 @@ class MatchingTests(unittest.TestCase):
         self.assertIsNone(plugin._automatic_match(matches))
         self.assertLess(matches[0][1], 100)
 
-    def test_track_picker_shows_local_title_and_artist(self):
+    def test_track_picker_shows_local_artist_title_and_length_on_one_line(self):
         subject = SimpleNamespace(_shell=SimpleNamespace(props=SimpleNamespace(window=None)))
         local = ("file:///song.ogg", "Local Artist", "Local Title", 180000)
         matches = [(track("candidate", "Spotify Title", "Spotify Artist"), 90.0, False)]
@@ -353,8 +353,7 @@ class MatchingTests(unittest.TestCase):
                 subject, matches, False, local, on_selected=Mock())
 
         label = widgets["Label"].call_args.kwargs["label"]
-        self.assertIn("Title: Local Title", label)
-        self.assertIn("Artist: Local Artist", label)
+        self.assertEqual(label, "Local Artist - Local Title (3:00)")
 
     def test_duration_breaks_name_tie_and_logs_every_rank(self):
         wrong_length = track("long", "Song", "Artist", duration_ms=220000)

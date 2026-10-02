@@ -940,10 +940,12 @@ class SpotifyPlaylistPlugin(GObject.Object, Peas.Activatable):
                         "Continue", Gtk.ResponseType.OK)
         dlg.set_default_size(680, 440)
         box = dlg.get_content_area()
-        _, artist, title, _ = local_match
+        _, artist, title, duration_ms = local_match
+        source = f"{artist} - {title}"
+        if isinstance(duration_ms, int):
+            source += f" ({duration_ms // 60000}:{duration_ms // 1000 % 60:02d})"
         box.pack_start(Gtk.Label(
-            label=f"Select the matching recording for:\nTitle: {title}\nArtist: {artist}",
-            xalign=0, margin=10, wrap=True), False, False, 0)
+            label=source, xalign=0, margin=10), False, False, 0)
         store = Gtk.ListStore(str, str, str, str)
         for track, score, exact in matches:
             artists = ", ".join(a.get("name", "") for a in track.get("artists", []))
