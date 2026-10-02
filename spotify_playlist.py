@@ -63,6 +63,7 @@ MATCHES_DB         = Path.home() / ".config" / "rhythmbox" / "spotify_playlist_m
 
 def _pkce_pair() -> tuple[str, str]:
     """Generate a PKCE verifier and its SHA-256 challenge."""
+    # Spotify receives the challenge now; the verifier is sent only with the token request.
     verifier  = secrets.token_urlsafe(64)[:128]
     digest    = hashlib.sha256(verifier.encode()).digest()
     challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
@@ -117,6 +118,7 @@ def _is_local_track(location: str) -> bool:
 # Keep one confirmed Spotify match per local file; search candidates never enter this database.
 def _open_matches_db(path: Path):
     """Open the local match database and ensure its table exists."""
+    # Each operation gets its own connection because searches run in a worker thread.
     path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(path, timeout=5)
     connection.execute("""CREATE TABLE IF NOT EXISTS track_matches (
@@ -152,6 +154,7 @@ def _load_match(location: str, artist: str, title: str,
 def _save_match(location: str, artist: str, title: str, duration_ms: Optional[int],
                 track: dict, path: Path = MATCHES_DB) -> None:
     """Store the confirmed Spotify track for a local file."""
+    # Streams have no stable local file identity, so never cache their matches.
     if not _is_local_track(location) or not track.get("uri"):
         return
     uri = track["uri"]
@@ -197,6 +200,7 @@ def _normalize(s: str) -> str:
 
 def _artist_names(value: str) -> list[str]:
     """Split and normalize the artist names in a credit field."""
+    # Rhythmbox can combine credits in one field; Spotify usually separates artists.
     parts = re.split(r"\s*(?:,|;|\s+[&×x]\s+|\s+(?:feat|ft|featuring)\.?\s+)\s*", value or "", flags=re.IGNORECASE)
     return [name for part in parts if (name := _normalize(part))]
 
@@ -263,6 +267,8 @@ def _match_details(candidate: dict, want_artist: str, want_title: str,
         score = 0.5 * title_score + 0.3 * artist_score + 0.2 * (duration_score or 0.0)
     if not valid:
         score = 0.0
+    # A high similarity score is insufficient for automatic selection: names must match,
+    # and known durations must differ by no more than two seconds.
     exact = (valid and title == wanted_title and artist_names == wanted_artists
              and (duration_ms is None or
                   (duration_delta is not None and duration_delta <= 2000)))
@@ -312,8 +318,8 @@ def _rank_candidates(tracks: list[dict], artist: str, title: str,
 
 
 def _automatic_match(matches: list[tuple[dict, float, bool]]) -> Optional[dict]:
-    # The list is already ranked, so the first exact match needs no track-choice dialog.
     """Return the first exact match from ranked candidates, if any."""
+    # The list is already ranked, so the first exact match needs no track-choice dialog.
     return next((track for track, _, is_exact in matches if is_exact), None)
 
 
@@ -341,6 +347,7 @@ class SpotifyClient:
 
     def _is_expired(self) -> bool:
         """Check whether the access token is expired or nearly expired."""
+        # Refresh early so an API request does not start with a nearly expired token.
         return time.time() > self._token.get("expires_at", 0) - 30
 
     def _refresh(self) -> None:
@@ -366,6 +373,7 @@ class SpotifyClient:
     def start_auth_flow(self, on_done) -> None:
         """Start browser-based PKCE authorization and report the result."""
         verifier, challenge = _pkce_pair()
+        # The callback must carry this state value to belong to our authorization attempt.
         state = secrets.token_hex(8)
         params = {
             "client_id":             self.client_id,
@@ -397,11 +405,13 @@ class SpotifyClient:
                         self.send_response(400); self.end_headers()
 
             srv = HTTPServer(("127.0.0.1", 8888), _H)
+            # Handle one browser callback, then stop the temporary local server.
             srv.timeout = 120
             srv.handle_request()
             srv.server_close()
 
             if not code_holder:
+                # GTK callbacks must run on the main loop, not in this HTTP worker thread.
                 GLib.idle_add(on_done, False)
                 return
 
@@ -448,6 +458,7 @@ class SpotifyClient:
         base_title = _split_title_credit(title)[0]
         lead_artist = _artist_names(artist)
         lead_artist = lead_artist[0] if lead_artist else artist
+        # The structured query is precise; the plain query recovers alternate credit formats.
         for q in [f"artist:{lead_artist} track:{base_title}", f"{lead_artist} {base_title}"]:
             try:
                 r = requests.get(
@@ -459,6 +470,7 @@ class SpotifyClient:
                 continue
             if r.ok:
                 succeeded = True
+                # Rank both first pages together and keep the first copy of each Spotify URI.
                 for item in r.json().get("tracks", {}).get("items", []):
                     if item and item.get("uri"):
                         tracks.setdefault(item["uri"], item)
@@ -709,6 +721,7 @@ class SpotifyPlaylistPlugin(GObject.Object, Peas.Activatable):
 
         def _confirm_clear(_button):
             """Confirm deletion of saved track matches and show the result."""
+            # Clearing stays available even while caching is disabled.
             confirm = Gtk.MessageDialog(transient_for=dlg, modal=True,
                                         message_type=Gtk.MessageType.QUESTION,
                                         buttons=Gtk.ButtonsType.NONE,
@@ -795,6 +808,7 @@ class SpotifyPlaylistPlugin(GObject.Object, Peas.Activatable):
         except (AttributeError, TypeError, ValueError):
             duration_ms = None
         local_match = (location, artist, title, duration_ms)
+        # Carry the local identity until the selected Spotify track is added to a playlist.
         window = self._shell.props.window
 
         wait = Gtk.MessageDialog(transient_for=window, modal=False,
@@ -805,6 +819,7 @@ class SpotifyPlaylistPlugin(GObject.Object, Peas.Activatable):
 
         def _search():
             """Use a saved match or search and rank Spotify candidates."""
+            # SQLite and network work stay off the GTK thread; GLib.idle_add returns results.
             try:
                 # A valid saved match skips Spotify search only when the option is enabled.
                 if self._settings.get("use_match_cache") and _is_local_track(location):
@@ -884,6 +899,7 @@ class SpotifyPlaylistPlugin(GObject.Object, Peas.Activatable):
         dlg.show_all()
         response = dlg.run()
         model, selected = selection.get_selected()
+        # Tree rows preserve ranked order, so their index identifies the selected track.
         index = model.get_path(selected).get_indices()[0] if selected else None
         dlg.destroy()
         if response != Gtk.ResponseType.OK or index is None:
@@ -905,8 +921,8 @@ class SpotifyPlaylistPlugin(GObject.Object, Peas.Activatable):
         artist = ", ".join(a.get("name", "") for a in track.get("artists", []))
 
         def _done(ok, pname):
-            # Persist only the chosen track, and only after Spotify accepts the playlist add.
             """Save a successful match or show the playlist add error."""
+            # Persist only the chosen track, and only after Spotify accepts the playlist add.
             if ok and local_match and self._settings.get("use_match_cache"):
                 try:
                     _save_match(*local_match, track)
