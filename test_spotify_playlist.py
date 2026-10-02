@@ -227,6 +227,58 @@ class MatchingTests(unittest.TestCase):
         subject._client.search_tracks.assert_not_called()
         subject._add_resolved_tracks.assert_not_called()
 
+    def test_last_playlist_is_selected_before_matching_without_a_picker(self):
+        subject = SimpleNamespace(
+            _shell=SimpleNamespace(props=SimpleNamespace(window=None)),
+            _last_pid="playlist", _last_playlist="My playlist",
+            _client=SimpleNamespace(get_playlists=Mock()))
+        selected = Mock()
+
+        plugin.SpotifyPlaylistPlugin._show_playlist_picker(
+            subject, None, add_to_last_id=True, on_playlist=selected)
+
+        selected.assert_called_once_with("playlist", "My playlist")
+        subject._client.get_playlists.assert_not_called()
+
+    def test_single_track_without_matches_keeps_track_not_found_error(self):
+        entry = Mock()
+        entry.get_string.side_effect = lambda prop: {
+            plugin.RB.RhythmDBPropType.ARTIST: "Artist",
+            plugin.RB.RhythmDBPropType.TITLE: "Song",
+            plugin.RB.RhythmDBPropType.LOCATION: "file:///song.ogg",
+        }[prop]
+        entry.get_ulong.return_value = 180
+
+        class ImmediateThread:
+            def __init__(self, target, **_kwargs):
+                self.target = target
+
+            def start(self):
+                self.target()
+
+        subject = SimpleNamespace(
+            _ensure_client=lambda: True, _ensure_authenticated=lambda: True,
+            _get_selected_entries=lambda: [entry],
+            _entry_metadata=lambda selected: plugin.SpotifyPlaylistPlugin._entry_metadata(
+                subject, selected),
+            _add_selected_tracks=lambda entries, last: plugin.SpotifyPlaylistPlugin._add_selected_tracks(
+                subject, entries, last),
+            _show_playlist_picker=Mock(side_effect=lambda _track, **kwargs:
+                                       kwargs["on_playlist"]("playlist", "My playlist")),
+            _show_error=Mock(), _add_resolved_tracks=Mock(),
+            _shell=SimpleNamespace(props=SimpleNamespace(window=None)),
+            _settings={"use_match_cache": False},
+            _client=SimpleNamespace(search_tracks=Mock(return_value=[])))
+
+        with patch.object(plugin.Gtk, "MessageDialog"), \
+             patch.object(plugin.GLib, "idle_add", side_effect=lambda callback, *args: callback(*args)), \
+             patch.object(plugin.threading, "Thread", ImmediateThread):
+            plugin.SpotifyPlaylistPlugin._on_add_to_playlist(subject, None, None)
+
+        subject._show_error.assert_called_once()
+        self.assertEqual(subject._show_error.call_args.args[0], "Track not found")
+        subject._add_resolved_tracks.assert_not_called()
+
     def test_batch_add_skips_failed_tracks_and_caches_only_successes(self):
         first = track("spotify:track:first", "First", "Artist")
         second = track("spotify:track:second", "Second", "Artist")

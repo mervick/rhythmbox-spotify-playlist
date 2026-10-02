@@ -847,6 +847,16 @@ class SpotifyPlaylistPlugin(GObject.Object, Peas.Activatable):
                         on_selected=lambda chosen: _selected(chosen))
                 else:
                     skipped.append(title)
+                    if len(local_matches) == 1:
+                        if error:
+                            self._show_error("Spotify search failed",
+                                             GLib.markup_escape_text(error))
+                        else:
+                            self._show_error(
+                                "Track not found",
+                                f'Could not find <b>{GLib.markup_escape_text(title)}</b> by '
+                                f'<b>{GLib.markup_escape_text(artist)}</b> on Spotify.')
+                        return
                     if error:
                         print(f"[spotify_playlist] Skipped {title!r}: {error}", flush=True)
                     _next(index + 1, playlist_id, playlist_name)
@@ -857,6 +867,8 @@ class SpotifyPlaylistPlugin(GObject.Object, Peas.Activatable):
                     resolved.append((track, local_match))
                 else:
                     skipped.append(title)
+                    if len(local_matches) == 1:
+                        return
                 _next(index + 1, playlist_id, playlist_name)
 
             def _search():
