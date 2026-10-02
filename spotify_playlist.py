@@ -790,23 +790,19 @@ class SpotifyPlaylistPlugin(GObject.Object, Peas.Activatable):
 
     # def _on_add_to_playlist(self, action, param, add_to_last_id=False) -> None:
     def _on_add_to_playlist(self, action, param, add_to_last_id=True) -> None:
-        """Resolve the selected Rhythmbox track to a Spotify track."""
+        """Resolve selected Rhythmbox tracks to Spotify tracks."""
         if not self._ensure_client() or not self._ensure_authenticated():
             return
 
-        entry = self._get_selected_entry()
-        if entry is None:
+        entries = self._get_selected_entries()
+        if not entries:
             self._show_error("No track selected", "Select a track in the library first.")
             return
+        if len(entries) > 1:
+            self._add_selected_tracks(entries, add_to_last_id)
+            return
 
-        artist = entry.get_string(RB.RhythmDBPropType.ARTIST) or ""
-        title  = entry.get_string(RB.RhythmDBPropType.TITLE)  or ""
-        location = entry.get_string(RB.RhythmDBPropType.LOCATION) or ""
-        try:
-            duration_seconds = entry.get_ulong(RB.RhythmDBPropType.DURATION)
-            duration_ms = duration_seconds * 1000 if duration_seconds else None
-        except (AttributeError, TypeError, ValueError):
-            duration_ms = None
+        location, artist, title, duration_ms = self._entry_metadata(entries[0])
         local_match = (location, artist, title, duration_ms)
         # Carry the local identity until the selected Spotify track is added to a playlist.
         window = self._shell.props.window
@@ -871,7 +867,128 @@ class SpotifyPlaylistPlugin(GObject.Object, Peas.Activatable):
 
         threading.Thread(target=_search, daemon=True).start()
 
-    def _show_track_picker(self, matches, add_to_last_id, local_match) -> None:
+    def _entry_metadata(self, entry) -> tuple[str, str, str, Optional[int]]:
+        """Read the selected entry's location, artist, title, and duration."""
+        artist = entry.get_string(RB.RhythmDBPropType.ARTIST) or ""
+        title = entry.get_string(RB.RhythmDBPropType.TITLE) or ""
+        location = entry.get_string(RB.RhythmDBPropType.LOCATION) or ""
+        try:
+            duration_seconds = entry.get_ulong(RB.RhythmDBPropType.DURATION)
+            duration_ms = duration_seconds * 1000 if duration_seconds else None
+        except (AttributeError, TypeError, ValueError):
+            duration_ms = None
+        return location, artist, title, duration_ms
+
+    def _add_selected_tracks(self, entries, add_to_last_id) -> None:
+        """Resolve multiple entries, then add the chosen matches to one playlist."""
+        resolved = []
+        skipped = []
+        local_matches = [self._entry_metadata(entry) for entry in entries]
+        window = self._shell.props.window
+
+        def _next(index):
+            """Resolve the next selected track or proceed to the playlist picker."""
+            if index == len(local_matches):
+                if not resolved:
+                    self._show_error("No tracks to add", "No selected tracks were matched on Spotify.")
+                    return
+                self._show_playlist_picker(
+                    resolved[0][0], add_to_last_id=add_to_last_id,
+                    on_playlist=lambda pid, pname: self._add_resolved_tracks(
+                        resolved, skipped, pid, pname), track_count=len(resolved))
+                return
+
+            local_match = local_matches[index]
+            location, artist, title, duration_ms = local_match
+            wait = Gtk.MessageDialog(
+                transient_for=window, modal=False, message_type=Gtk.MessageType.INFO,
+                buttons=Gtk.ButtonsType.NONE,
+                text=f'Searching Spotify ({index + 1}/{len(entries)}):\n"{title}" — {artist}')
+            wait.show()
+
+            def _finish(track, matches=None, error=None):
+                """Handle one search result on the GTK thread."""
+                wait.destroy()
+                if track:
+                    resolved.append((track, local_match))
+                    _next(index + 1)
+                elif matches:
+                    self._show_track_picker(
+                        matches, add_to_last_id, local_match,
+                        on_selected=lambda chosen: _selected(chosen))
+                else:
+                    skipped.append(title)
+                    if error:
+                        print(f"[spotify_playlist] Skipped {title!r}: {error}", flush=True)
+                    _next(index + 1)
+
+            def _selected(track):
+                """Keep a manually chosen match or skip the cancelled track."""
+                if track:
+                    resolved.append((track, local_match))
+                else:
+                    skipped.append(title)
+                _next(index + 1)
+
+            def _search():
+                """Read a saved match or search Spotify in a worker thread."""
+                try:
+                    if self._settings.get("use_match_cache") and _is_local_track(location):
+                        try:
+                            cached = _load_match(*local_match)
+                        except (sqlite3.Error, OSError, ValueError) as exc:
+                            print(f"[spotify_playlist] Match cache read failed: {exc}", flush=True)
+                        else:
+                            if cached:
+                                GLib.idle_add(_finish, cached)
+                                return
+                    tracks = self._client.search_tracks(artist, title)
+                    matches = _rank_candidates(tracks, artist, title, duration_ms)
+                    GLib.idle_add(_finish, _automatic_match(matches), matches)
+                except Exception as exc:
+                    GLib.idle_add(_finish, None, None, str(exc))
+
+            threading.Thread(target=_search, daemon=True).start()
+
+        _next(0)
+
+    def _add_resolved_tracks(self, resolved, skipped, playlist_id, playlist_name) -> None:
+        """Add resolved tracks in order and report a complete failure."""
+        def _add():
+            """Send each track to Spotify and persist only successful matches."""
+            added = 0
+            failed = list(skipped)
+            for track, local_match in resolved:
+                try:
+                    ok = self._client.add_to_playlist(playlist_id, track["uri"])
+                except Exception as exc:
+                    ok = False
+                    print(f"[spotify_playlist] Add failed for {track['uri']!r}: {exc}", flush=True)
+                if not ok:
+                    failed.append(local_match[2])
+                    continue
+                added += 1
+                if self._settings.get("use_match_cache"):
+                    try:
+                        _save_match(*local_match, track)
+                    except (sqlite3.Error, OSError, ValueError) as exc:
+                        print(f"[spotify_playlist] Match cache write failed: {exc}", flush=True)
+            GLib.idle_add(_done, added, failed)
+
+        def _done(added, failed):
+            """Log the result and show an error if no tracks were added."""
+            print(f"[spotify_playlist] Added {added} track(s) to {playlist_name!r}; "
+                  f"skipped or failed: {len(failed)}", flush=True)
+            if added:
+                return
+            self._show_error("Failed to add tracks",
+                             "No tracks were added to the playlist. "
+                             "Check the Rhythmbox console for details.")
+
+        threading.Thread(target=_add, daemon=True).start()
+
+    def _show_track_picker(self, matches, add_to_last_id, local_match,
+                           on_selected=None) -> None:
         """Let the user choose a Spotify track from ranked candidates."""
         dlg = Gtk.Dialog(title="Choose Spotify track",
                          transient_for=self._shell.props.window, modal=True)
@@ -904,17 +1021,23 @@ class SpotifyPlaylistPlugin(GObject.Object, Peas.Activatable):
         dlg.destroy()
         if response != Gtk.ResponseType.OK or index is None:
             print("[spotify_playlist] Track selection cancelled", flush=True)
+            if on_selected:
+                on_selected(None)
             return
         track = matches[index][0]
         print(f"[spotify_playlist] User selected rank={index + 1}/{len(matches)} "
               f"uri={track['uri']!r}", flush=True)
-        self._show_playlist_picker(track, add_to_last_id=add_to_last_id,
-                                   local_match=local_match)
+        if on_selected:
+            on_selected(track)
+        else:
+            self._show_playlist_picker(track, add_to_last_id=add_to_last_id,
+                                       local_match=local_match)
 
     # ------------------------------------------------------------------ playlist picker
 
-    def _show_playlist_picker(self, track, add_to_last_id=False, local_match=None) -> None:
-        """Add the track to the last playlist or let the user choose one."""
+    def _show_playlist_picker(self, track, add_to_last_id=False, local_match=None,
+                              on_playlist=None, track_count=1) -> None:
+        """Choose a playlist, then add a track or pass it to a batch callback."""
         window = self._shell.props.window
         track_uri = track["uri"]
         title = track["name"]
@@ -938,6 +1061,9 @@ class SpotifyPlaylistPlugin(GObject.Object, Peas.Activatable):
                 d.run(); d.destroy()
 
         if add_to_last_id and self._last_pid is not None:
+            if on_playlist:
+                on_playlist(self._last_pid, self._last_playlist)
+                return
             ok = self._client.add_to_playlist(self._last_pid, track_uri)
             GLib.idle_add(_done, ok, self._last_playlist)
             return
@@ -968,10 +1094,11 @@ class SpotifyPlaylistPlugin(GObject.Object, Peas.Activatable):
             dlg.set_default_size(420, 400)
 
             box = dlg.get_content_area()
+            prompt = (f'Add {track_count} selected tracks to:' if track_count > 1 else
+                      f'Add  <b>{GLib.markup_escape_text(title)}</b>'
+                      f'  by  <b>{GLib.markup_escape_text(artist)}</b>  to:')
             box.pack_start(
-                Gtk.Label(use_markup=True, xalign=0, margin=10,
-                          label=f'Add  <b>{GLib.markup_escape_text(title)}</b>'
-                                f'  by  <b>{GLib.markup_escape_text(artist)}</b>  to:'),
+                Gtk.Label(use_markup=True, xalign=0, margin=10, label=prompt),
                 False, False, 0)
 
             store = Gtk.ListStore(str, str)
@@ -999,6 +1126,9 @@ class SpotifyPlaylistPlugin(GObject.Object, Peas.Activatable):
 
             self._last_pid = pid
             self._last_playlist = pname
+            if on_playlist:
+                on_playlist(pid, pname)
+                return
 
             def _add():
                 """Add the track to the chosen playlist in a worker thread."""
@@ -1011,20 +1141,19 @@ class SpotifyPlaylistPlugin(GObject.Object, Peas.Activatable):
 
     # ------------------------------------------------------------------ helpers
 
-    def _get_selected_entry(self):
-        """Return the first selected entry in the current page, or None."""
+    def _get_selected_entries(self):
+        """Return all selected entries in the current page."""
         try:
             page = self._shell.props.selected_page
             if page is None:
-                return None
+                return []
             entry_view = page.get_entry_view()
             if entry_view is None:
-                return None
-            entries = entry_view.get_selected_entries()
-            return entries[0] if entries else None
+                return []
+            return list(entry_view.get_selected_entries() or [])
         except Exception as e:
-            print(f"[spotify_playlist] _get_selected_entry error: {e}")
-            return None
+            print(f"[spotify_playlist] _get_selected_entries error: {e}")
+            return []
 
     def _build_client(self) -> None:
         """Create a Spotify client when a client ID is configured."""
